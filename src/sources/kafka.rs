@@ -1730,7 +1730,7 @@ mod integration_test {
         SourceSender,
         event::{EventArray, EventContainer},
         shutdown::ShutdownSignal,
-        test_util::{collect_n, components::assert_source_compliance, random_string},
+        test_util::{collect_n, components::assert_source_compliance, random_string, trace_init},
     };
 
     const KEY: &str = "my key";
@@ -2586,6 +2586,7 @@ mod integration_test {
     /// reproducible without hooks in production code, so this test guards the coordination
     /// logic rather than the race itself.
     async fn consume_after_aborted_drain(rebalance_strategy: String) {
+        trace_init();
         const PARTITIONS: i32 = 4;
         const INITIAL_COUNT: usize = 2000;
         const FOLLOW_UP_COUNT: usize = 400;
@@ -2639,6 +2640,8 @@ mod integration_test {
             INITIAL_COUNT,
             "Source A did not deliver the initial messages after the rebalances."
         );
+        // Give every partition stream time to poll its now-empty queue and park, so that the
+        // follow-up messages below can only be consumed through the queue's wake-up callback.
         sleep(Duration::from_secs(1)).await;
         let initial_high_offsets: HashMap<i64, i64> =
             received.iter().fold(HashMap::new(), |mut acc, (p, o)| {

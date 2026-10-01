@@ -1,0 +1,9 @@
+FROM timberio/vector:0.58.0-debian@sha256:1c1ea358c617ea0b23003d5af87f7a678b30f8f7096437e680380c47fc13d2d9
+
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.source="https://github.com/espressocomputing/vector" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.opencontainers.image.version="0.58.0-espresso"
+
+COPY vector /usr/bin/vector
+RUN ["vector", "--version"]

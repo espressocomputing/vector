@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 revision=$(git rev-parse HEAD)
 image=${1:-vector:0.58.0-espresso-${revision:0:12}}
-features=sources-kafka,sources-internal_metrics,sources-stdin,sinks-aws_s3,sinks-prometheus,sinks-console,transforms-remap,transforms-filter,codecs-parquet,vrl/stdlib,kafka-integration-tests
+features=sources-kafka,sources-internal_metrics,sources-internal_logs,sources-stdin,sinks-aws_s3,sinks-prometheus,sinks-console,sinks-opentelemetry,transforms-remap,transforms-filter,codecs-parquet,vrl/stdlib,kafka-integration-tests
 
 cargo build --locked --release --no-default-features --features "$features"
 context=$(mktemp -d)

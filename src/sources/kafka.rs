@@ -634,6 +634,9 @@ impl ConsumerStateInner<Consuming> {
 
         let (end_tx, mut end_signal) = oneshot::channel::<()>();
 
+        #[cfg(all(test, feature = "kafka-integration-tests"))]
+        let p = integration_test::queue_drop_gate::Queue::wrap(p, &tp);
+
         let handle = join_set.spawn(async move {
             let mut messages = p.stream();
             let (finalizer, mut ack_stream) = OrderedFinalizer::<FinalizerEntry>::new(None);
@@ -2694,6 +2697,214 @@ mod integration_test {
     async fn consumes_after_aborted_drain_sticky_assignments() {
         // Cooperative rebalance strategies only revoke the partitions that move to another member
         consume_after_aborted_drain("cooperative-sticky".into()).await;
+    }
+
+    pub(super) mod queue_drop_gate {
+        use std::sync::{
+            Condvar, LazyLock, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        use super::*;
+
+        static GATES: LazyLock<Mutex<HashMap<String, Arc<Gate>>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+
+        pub(super) struct Gate {
+            armed: AtomicBool,
+            pub(super) entered: tokio::sync::Notify,
+            released: Mutex<bool>,
+            wake: Condvar,
+        }
+
+        pub(super) struct Registration {
+            topic: String,
+            pub(super) gate: Arc<Gate>,
+        }
+
+        impl Registration {
+            pub(super) fn new(topic: String) -> Self {
+                let gate = Arc::new(Gate {
+                    armed: AtomicBool::new(true),
+                    entered: tokio::sync::Notify::new(),
+                    released: Mutex::new(false),
+                    wake: Condvar::new(),
+                });
+                GATES
+                    .lock()
+                    .unwrap()
+                    .insert(topic.clone(), Arc::clone(&gate));
+                Self { topic, gate }
+            }
+
+            pub(super) fn release(&self) {
+                *self.gate.released.lock().unwrap() = true;
+                self.gate.wake.notify_all();
+            }
+        }
+
+        impl Drop for Registration {
+            fn drop(&mut self) {
+                self.release();
+                GATES.lock().unwrap().remove(&self.topic);
+            }
+        }
+
+        pub(in crate::sources::kafka) struct Queue {
+            queue: StreamPartitionQueue<KafkaSourceContext>,
+            gate: Option<Arc<Gate>>,
+        }
+
+        impl Queue {
+            pub(in crate::sources::kafka) fn wrap(
+                queue: StreamPartitionQueue<KafkaSourceContext>,
+                tp: &TopicPartition,
+            ) -> Self {
+                let gate = GATES.lock().unwrap().get(&tp.0).cloned();
+                Self { queue, gate }
+            }
+        }
+
+        impl std::ops::Deref for Queue {
+            type Target = StreamPartitionQueue<KafkaSourceContext>;
+
+            fn deref(&self) -> &Self::Target {
+                &self.queue
+            }
+        }
+
+        impl Drop for Queue {
+            fn drop(&mut self) {
+                if let Some(gate) = &self.gate
+                    && gate.armed.swap(false, Ordering::SeqCst)
+                {
+                    gate.entered.notify_one();
+                    let released = gate.released.lock().unwrap();
+                    drop(
+                        gate.wake
+                            .wait_while(released, |released| !*released)
+                            .unwrap(),
+                    );
+                }
+                // The real queue drops after this hook, removing its librdkafka wake-up callback.
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn waits_for_partition_queue_drop_before_reassignment() {
+        trace_init();
+        let (topic, group, _) = send_to_test_topic(1, 20).await;
+        let gate = queue_drop_gate::Registration::new(topic.clone());
+        let config = make_config(&topic, &group, LogNamespace::Legacy, None);
+        let decoder = DecodingConfig::new(
+            config.framing.clone(),
+            config.decoding.clone(),
+            LogNamespace::Legacy,
+        )
+        .build()
+        .unwrap();
+        let (consumer, callbacks) = create_consumer(&config, true).unwrap();
+        let consumer = Arc::new(consumer);
+        let mut assignment = TopicPartitionList::new();
+        assignment
+            .add_partition_offset(&topic, 0, Offset::Beginning)
+            .unwrap();
+        consumer.assign(&assignment).unwrap();
+        let (out, mut events) = ack_pipeline(1);
+        let state = ConsumerStateInner::new(
+            config,
+            decoder,
+            None,
+            out,
+            LogNamespace::Legacy,
+            Span::current(),
+        );
+        let coordinator = tokio::spawn(coordinate_kafka_callbacks(
+            Arc::clone(&consumer),
+            callbacks,
+            state,
+            Duration::from_millis(10),
+            None,
+        ));
+        let (assigned, ready) = sync_channel(0);
+        consumer
+            .context()
+            .callbacks
+            .send(KafkaCallback::PartitionsAssigned(
+                vec![(topic.clone(), 0)],
+                assigned,
+            ))
+            .unwrap();
+        assert!(matches!(
+            ready.recv_timeout(Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        ));
+
+        let (revoke, finished) = sync_channel(0);
+        consumer
+            .context()
+            .callbacks
+            .send(KafkaCallback::PartitionsRevoked(
+                vec![(topic.clone(), 0)],
+                revoke,
+            ))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.gate.entered.notified())
+            .await
+            .unwrap();
+        // Hold the old queue in Drop across the abort deadline: releasing the callback now
+        // would let a new queue install its wake-up before the old queue removes it.
+        let released_early = !matches!(
+            finished.recv_timeout(Duration::from_secs(1)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        );
+        gate.release();
+        if !released_early {
+            assert!(matches!(
+                finished.recv_timeout(Duration::from_secs(5)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            ));
+        }
+
+        consumer.assign(&assignment).unwrap();
+        let (assigned, ready) = sync_channel(0);
+        consumer
+            .context()
+            .callbacks
+            .send(KafkaCallback::PartitionsAssigned(
+                vec![(topic.clone(), 0)],
+                assigned,
+            ))
+            .unwrap();
+        assert!(matches!(
+            ready.recv_timeout(Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        ));
+        let mut received = HashSet::new();
+        collect_offsets(&mut events, &mut received, 20, Duration::from_secs(10)).await;
+        send_events(topic, 1, 20).await;
+        collect_offsets(&mut events, &mut received, 40, Duration::from_secs(10)).await;
+        let (shutdown, _done) = sync_channel(0);
+        consumer
+            .context()
+            .callbacks
+            .send(KafkaCallback::ShuttingDown(shutdown))
+            .unwrap();
+        drop(_done);
+        tokio::time::timeout(Duration::from_secs(5), coordinator)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !released_early,
+            "rebalance released before the old partition queue finished dropping"
+        );
+        assert_eq!(
+            received.len(),
+            40,
+            "reassigned queue did not consume every offset"
+        );
     }
 
     fn map_logs(events: EventArray) -> impl Iterator<Item = String> {

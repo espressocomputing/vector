@@ -517,12 +517,9 @@ async fn kafka_source(
 /// Only then is Draining traded in for either a Consuming (after a revoke) or
 /// Complete (in the case of shutdown) state, via the `finish_drain` method.
 ///
-/// Waiting for aborted tasks matters: a partition task owns the rdkafka partition
-/// queue. If the rebalance were allowed to continue while an aborted task was still
-/// being dropped, the partition could be re-assigned and a new queue split off for it
-/// before the old queue is gone. Both queues share one librdkafka queue, and dropping
-/// the old one removes the wake-up callback the new one relies on, which silently
-/// stops consumption of that partition (see vectordotdev/vector#22006).
+/// Aborted tasks must drop their partition queues before reassignment: an old queue's
+/// destructor can remove the new queue's shared librdkafka wake-up callback and stall
+/// consumption (vectordotdev/vector#22006).
 ///
 /// A ConsumerStateInner<Complete> is the final state, reached after a shutdown
 /// signal is received. This can not be traded for another state, and the
@@ -542,8 +539,7 @@ struct Consuming {
 struct Draining {
     /// The rendezvous channel sender from the revoke or shutdown callback. Sending on this channel
     /// indicates to the kafka client task that one or more partitions have been drained, while
-    /// closing this channel indicates that all expected partitions have drained, or the drain
-    /// timeout has been reached.
+    /// closing this channel indicates that all expected partition tasks have ended.
     signal: SyncSender<()>,
 
     /// The set of topic-partition tasks that are required to complete during
@@ -558,9 +554,7 @@ struct Draining {
     /// a Consuming state.
     shutdown: bool,
 
-    /// Whether the drain deadline has already fired and the remaining partition
-    /// tasks have been aborted. The drain then only waits for those tasks to end,
-    /// which is not bounded: proceeding without them could re-introduce the stall.
+    /// Whether the deadline fired. Aborted tasks must still finish before draining completes.
     aborted: bool,
 
     /// The source's tracing Span used to instrument metrics emitted by consumer tasks
@@ -619,7 +613,7 @@ impl ConsumerStateInner<Consuming> {
     /// that can be used to forcefully end the task.
     fn consume_partition(
         &self,
-        join_set: &mut JoinSet<(TopicPartition, PartitionConsumerStatus)>,
+        join_set: &mut JoinSet<PartitionConsumerStatus>,
         tp: TopicPartition,
         consumer: Arc<StreamConsumer<KafkaSourceContext>>,
         p: StreamPartitionQueue<KafkaSourceContext>,
@@ -698,7 +692,7 @@ impl ConsumerStateInner<Consuming> {
                     },
                 )
             }
-            (tp, status)
+            status
         }.instrument(self.consumer_state.span.clone()));
         (end_tx, handle)
     }
@@ -741,18 +735,11 @@ impl ConsumerStateInner<Draining> {
         self.consumer_state.expect_drain.insert(tp);
     }
 
-    /// Add the given TopicPartition to the set of known "drained" partitions,
-    /// i.e. the consumer has drained the acknowledgement channel, or its task was
-    /// aborted and has ended. For a drained partition a signal is sent on the signal
-    /// channel, indicating to the client that offsets may be committed. Once tasks have
-    /// been aborted no signal is sent anymore: each signal costs the client a synchronous
-    /// commit while the rebalance callback is blocked, and the client commits once more
-    /// after the drain anyway (in `pre_rebalance` after a revoke, and at the end of
-    /// `kafka_source` on shutdown), which covers any offsets stored by these tasks.
+    /// Account for an ended task, including cancellation or panic.
     fn partition_drained(&mut self, tp: TopicPartition) {
         if !self.consumer_state.aborted {
-            // This send() will only return Err if the receiver has already been disconnected (i.e. the
-            // kafka client task is no longer running)
+            // Avoid per-task synchronous commits after abort; pre_rebalance or kafka_source
+            // commits the stored offsets once draining finishes.
             _ = self.consumer_state.signal.send(());
         }
         self.consumer_state.expect_drain.remove(&tp);
@@ -808,8 +795,7 @@ async fn coordinate_kafka_callbacks(
     // is both consuming the messages (passing them to the output stream) _and_
     // processing the corresponding acknowledgement stream. A consumer task
     // should completely drain its acknowledgement stream after receiving an end signal
-    let mut partition_consumers: JoinSet<(TopicPartition, PartitionConsumerStatus)> =
-        Default::default();
+    let mut partition_consumers: JoinSet<PartitionConsumerStatus> = Default::default();
 
     // Handles that will let us end any consumer task that exceeds a drain deadline
     let mut abort_handles: HashMap<TopicPartition, tokio::task::AbortHandle> = HashMap::new();
@@ -823,30 +809,26 @@ async fn coordinate_kafka_callbacks(
     while let ConsumerState::Consuming(_) | ConsumerState::Draining(_) = consumer_state {
         tokio::select! {
             Some(result) = partition_consumers.join_next_with_id(), if !partition_consumers.is_empty() => {
-                let (task_id, finished_partition, status) = match result {
-                    Ok((task_id, (tp, status))) => (task_id, tp, status),
-                    Err(join_error) => match task_partitions.get(&join_error.id()) {
-                        Some(tp) => {
-                            if join_error.is_cancelled() {
-                                debug!(message = "Partition consumer task was aborted.", topic = %tp.0, partition = tp.1);
-                            } else {
-                                error!(
-                                    message = "Partition consumer task ended unexpectedly.",
-                                    topic = %tp.0,
-                                    partition = tp.1,
-                                    error = %join_error,
-                                );
-                            }
-                            (join_error.id(), tp.clone(), PartitionConsumerStatus::NormalExit)
-                        }
-                        None => {
-                            error!(message = "Unknown partition consumer task ended.", error = %join_error);
-                            continue;
-                        }
-                    },
+                let (task_id, result) = match result {
+                    Ok((task_id, status)) => (task_id, Ok(status)),
+                    Err(error) => (error.id(), Err(error)),
                 };
-                debug!("Partition consumer finished for {}:{}", &finished_partition.0, finished_partition.1);
-                task_partitions.remove(&task_id);
+                let Some(finished_partition) = task_partitions.remove(&task_id) else {
+                    error!(message = "Unknown partition consumer task ended.", ?task_id);
+                    continue;
+                };
+                let status = result.unwrap_or_else(|error| {
+                    if !error.is_cancelled() {
+                        error!(
+                            message = "Partition consumer task ended unexpectedly.",
+                            topic = %finished_partition.0,
+                            partition = finished_partition.1,
+                            %error,
+                        );
+                    }
+                    PartitionConsumerStatus::NormalExit
+                });
+                debug!(message = "Partition consumer finished.", topic = %finished_partition.0, partition = finished_partition.1);
                 // Only clean up the handles if they belong to this task and not to a newer
                 // consumer task for the same partition. If this task ended on its own, the
                 // end_signal for it will still be in here.
@@ -983,40 +965,32 @@ async fn coordinate_kafka_callbacks(
                     warn!("A drain deadline fired outside of draining mode.");
                     state.keep_consuming(None.into())
                 },
-                ConsumerState::Draining(mut draining) if !draining.consumer_state.aborted => {
-                    debug!("Acknowledgement drain deadline reached. Aborting consumer tasks for revoked partitions.");
-                    // Abort the tasks that did not drain in time. They are still expected to
-                    // finish: the JoinSet reports each aborted task once its future (and the
-                    // partition queue it owns) has actually been dropped, and only then may the
-                    // rebalance or shutdown proceed. Every partition still expected to drain has a
-                    // task that has not been reaped yet, so its abort handle must be present.
-                    draining.consumer_state.expect_drain.retain(|tp| match abort_handles.get(tp) {
-                        Some(handle) => {
-                            handle.abort();
-                            true
-                        }
-                        None => {
-                            error!(message = "Partition expected to drain has no consumer task.", topic = %tp.0, partition = tp.1);
-                            false
-                        }
-                    });
-                    draining.consumer_state.aborted = true;
+                ConsumerState::Draining(mut draining) => {
+                    if draining.consumer_state.aborted {
+                        warn!(
+                            message = "Still waiting for aborted partition consumer tasks to end.",
+                            partitions = ?draining.consumer_state.expect_drain,
+                        );
+                    } else {
+                        debug!("Acknowledgement drain deadline reached. Aborting consumer tasks for revoked partitions.");
+                        draining.consumer_state.expect_drain.retain(|tp| match abort_handles.get(tp) {
+                            Some(handle) => {
+                                handle.abort();
+                                true
+                            }
+                            None => {
+                                error!(message = "Partition expected to drain has no consumer task.", topic = %tp.0, partition = tp.1);
+                                false
+                            }
+                        });
+                        draining.consumer_state.aborted = true;
+                    }
                     if draining.is_drain_complete() {
                         draining.finish_drain(None.into())
                     } else {
-                        // Aborted tasks end at their next await point, so this should be quick.
-                        // The timer is only re-armed to make an unexpectedly long wait visible.
+                        // Keep waiting for queue destruction; the timer only triggers warnings.
                         draining.keep_draining(Some(Box::pin(tokio::time::sleep(max_drain_ms))).into())
                     }
-                }
-                ConsumerState::Draining(draining) => {
-                    // Continuing without the aborted tasks would re-open the race this drain
-                    // protects against, so keep waiting for them and make the delay visible.
-                    warn!(
-                        message = "Still waiting for aborted partition consumer tasks to end.",
-                        partitions = ?draining.consumer_state.expect_drain,
-                    );
-                    draining.keep_draining(Some(Box::pin(tokio::time::sleep(max_drain_ms))).into())
                 }
             },
         }

@@ -5,5 +5,10 @@ LABEL org.opencontainers.image.source="https://github.com/espressocomputing/vect
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.version="0.58.0-espresso"
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419+deb13u1 && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY vector /usr/bin/vector
 RUN ["vector", "--version"]
